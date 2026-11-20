@@ -1,0 +1,221 @@
+name: Build Stardust Petals (Godot Android APK)
+
+# Runs on every push and by hand (Actions tab -> "Build Stardust Petals" -> Run workflow).
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+# "contents: write" lets the workflow commit the generated ElevenLabs audio back to your repo,
+# so it is only ever generated ONCE (saves your API credits).
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.4.1"
+  GODOT_CHANNEL: "stable"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same workflow as your other projects: if a .zip is in the repo root it is unzipped over the
+      # repo files, otherwise the repo files are built as they are.
+      - name: Unzip project zip from the repo root (if present)
+        run: |
+          ZIP=$(ls -1t *.zip 2>/dev/null | head -n1 || true)
+          if [ -n "$ZIP" ]; then
+            echo "Unzipping $ZIP over the repo files"
+            unzip -o -q "$ZIP" -x "__MACOSX/*" ".github/*"
+          else
+            echo "No zip found - building the repo files as they are"
+          fi
+
+      - name: Locate the Godot project
+        id: proj
+        run: |
+          P=$(find . -name project.godot -not -path "./.godot/*" | head -n1)
+          if [ -z "$P" ]; then echo "::error::project.godot not found"; exit 1; fi
+          D=$(dirname "$P")
+          echo "dir=$D" >> "$GITHUB_OUTPUT"
+          echo "Godot project folder: $D"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ---------- Godot + export templates (downloaded from GitHub's servers, then cached) ----------
+      - name: Cache Godot and Android export templates
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/godot-bin
+            ~/.local/share/godot/export_templates
+          key: godot-${{ env.GODOT_VERSION }}-${{ env.GODOT_CHANNEL }}-android-v1
+
+      - name: Download Godot and the Android export templates
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          BASE="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_CHANNEL}"
+          mkdir -p "$HOME/godot-bin" /tmp/dl
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/dl/godot.zip "$BASE/Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_linux.x86_64.zip"
+          unzip -q -o /tmp/dl/godot.zip -d /tmp/dl
+          mv "/tmp/dl/Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_linux.x86_64" "$HOME/godot-bin/godot"
+          chmod +x "$HOME/godot-bin/godot"
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/dl/templates.tpz "$BASE/Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_export_templates.tpz"
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_CHANNEL}"
+          mkdir -p "$TPL"
+          unzip -j -o -q /tmp/dl/templates.tpz 'templates/android_*' 'templates/version.txt' -d "$TPL"
+          ls -la "$TPL"
+          rm -rf /tmp/dl
+
+      # ---------- Android SDK (preinstalled on the runner; make sure the pieces Godot needs exist) ----------
+      - name: Prepare the Android SDK
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then SDKM=$(find "$SDK/cmdline-tools" -name sdkmanager | head -n1); fi
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          if ! ls "$SDK"/build-tools/*/apksigner > /dev/null 2>&1; then
+            "$SDKM" "build-tools;34.0.0" "platform-tools"
+          fi
+          ls "$SDK/build-tools"
+
+      - name: Tell Godot where Java and the Android SDK are
+        run: |
+          mkdir -p "$HOME/.config/godot"
+          cat > "$HOME/.config/godot/editor_settings-4.4.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_SDK"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          EOF
+          cat "$HOME/.config/godot/editor_settings-4.4.tres"
+
+      # ---------- Assets downloaded on GitHub's servers ----------
+      - name: Download the 3D model (CC0 VRoid girl) from GitHub
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: python3 tools/fetch_assets.py
+
+      # ---------- ElevenLabs voice + sound effects: only what is missing ----------
+      # Put your key in: repo -> Settings -> Secrets and variables -> Actions -> New repository secret
+      # Name: ELEVENLABS_API_KEY.   Without it the game just builds without sound.
+      - name: Generate missing ElevenLabs audio (cached in the repo)
+        id: audio
+        working-directory: ${{ steps.proj.outputs.dir }}
+        env:
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+        run: python3 tools/generate_audio.py
+
+      - name: Save new audio back to the repo (so it is never generated twice)
+        if: steps.audio.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          AUDIO_DIR: ${{ steps.proj.outputs.dir }}/assets/audio
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f "$AUDIO_DIR"
+          git commit -m "chore: cache generated ElevenLabs audio [skip ci]" || exit 0
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Upload audio as a backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-cache
+          path: ${{ steps.proj.outputs.dir }}/assets/audio
+          if-no-files-found: ignore
+
+      # ---------- Signing ----------
+      # Optional secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD.
+      # If they are not set a keystore is generated with keytool and cached, so every build
+      # keeps the SAME signature and installs as an update over the previous one.
+      - name: Restore the generated keystore (if any)
+        uses: actions/cache@v4
+        with:
+          path: ~/.android-keystore
+          key: stardust-petals-keystore-v1
+
+      - name: Prepare the signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            KS="$RUNNER_TEMP/release.keystore"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            ALIAS="${KEY_ALIAS:-key0}"
+            SPASS="$KEYSTORE_PASSWORD"
+            KPASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+            echo "Using the keystore from your GitHub secrets"
+          else
+            mkdir -p "$HOME/.android-keystore"
+            KS="$HOME/.android-keystore/release.keystore"
+            ALIAS="stardust"
+            SPASS="stardustpetals"
+            KPASS="stardustpetals"
+            if [ ! -f "$KS" ]; then
+              keytool -genkeypair -v -keystore "$KS" -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+                -storepass "$SPASS" -keypass "$KPASS" -dname "CN=Stardust Petals, O=Indie, C=US"
+            fi
+            echo "Using the auto-generated keystore"
+          fi
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$KS" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=$ALIAS" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=$SPASS" >> "$GITHUB_ENV"
+
+      # ---------- Build ----------
+      - name: Import the project (textures are compressed for phones here)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          "$HOME/godot-bin/godot" --headless --import || true
+          # second pass makes sure the script class cache is complete
+          "$HOME/godot-bin/godot" --headless --import || true
+
+      - name: Export the signed release APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          mkdir -p build
+          "$HOME/godot-bin/godot" --headless --verbose --export-release "Android" build/StardustPetals.apk 2>&1 | tee build/export.log
+          if [ ! -s build/StardustPetals.apk ]; then
+            echo "::error::The APK was not created - see build/export.log"
+            exit 1
+          fi
+          ls -la build
+          echo "### Stardust Petals APK built" >> "$GITHUB_STEP_SUMMARY"
+          echo "Size: $(du -h build/StardustPetals.apk | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Voice/SFX clips found: $(find assets/audio -name '*.mp3' | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: StardustPetals-APK
+          path: ${{ steps.proj.outputs.dir }}/build/StardustPetals.apk
+
+      - name: Upload the build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ steps.proj.outputs.dir }}/build/export.log
+          if-no-files-found: ignore
+          
