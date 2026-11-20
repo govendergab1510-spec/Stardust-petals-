@@ -1,2 +1,0 @@
-# Stardust-petals-
-Good game
