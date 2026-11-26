@@ -1,0 +1,174 @@
+name: Build and deploy STRIKEOUT 3D (Godot Web -> GitHub Pages)
+
+# Runs on every push and by hand (Actions tab -> Run workflow).
+# ONE-TIME SETUP: repo Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.4.1"
+  GODOT_CHANNEL: "stable"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Remove the OLD anime game (project files + its voice/sound-effect mp3s) from the repo ----
+      - name: Remove the old anime game files and audio from the repo
+        run: |
+          CHANGED=0
+          # (a) the old anime voice + sound-effect mp3s, its cache index and its old zip(s)
+          if [ -d assets/audio/voice ] || [ -d assets/audio/sfx ] || [ -f assets/audio/cache_index.json ] || ls stardust-petals*.zip > /dev/null 2>&1; then
+            echo "Old anime game audio / zip found - deleting it from the repo"
+            git rm -r -q -f --ignore-unmatch assets/audio/voice assets/audio/sfx assets/audio/cache_index.json
+            git rm -q -f --ignore-unmatch stardust-petals*.zip
+            rm -rf assets/audio/voice assets/audio/sfx assets/audio/cache_index.json stardust-petals*.zip
+            CHANGED=1
+          fi
+          # (b) the old anime project files, if they were committed as files instead of a zip
+          if [ -f data/story.json ] && grep -q "STARDUST PETALS" data/story.json 2>/dev/null; then
+            echo "Old anime project files found - deleting them"
+            git rm -r -q -f --ignore-unmatch assets/models data scripts shaders scenes tools project.godot export_presets.cfg icon.svg README.md CREDITS.md .gitignore
+            rm -rf assets/models data scripts shaders scenes tools project.godot export_presets.cfg icon.svg README.md CREDITS.md .gitignore .godot
+            CHANGED=1
+          fi
+          if [ "$CHANGED" = "1" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: remove old anime game audio and files [skip ci]" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::could not push the cleanup (the build still continues)"
+          else
+            echo "Nothing from the old game to remove."
+          fi
+
+      - name: Unzip project zip from the repo root (if present)
+        run: |
+          ZIP=$(ls -1t strikeout*.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$ZIP" ]; then ZIP=$(ls -1t *.zip 2>/dev/null | head -n1 || true); fi
+          if [ -n "$ZIP" ]; then
+            echo "Unzipping $ZIP over the repo files"
+            unzip -o -q "$ZIP" -x "__MACOSX/*" ".github/*"
+          else
+            echo "No zip found - building the repo files as they are"
+          fi
+
+      - name: Locate the Godot project
+        id: proj
+        run: |
+          P=$(find . -name project.godot -not -path "./.godot/*" | head -n1)
+          if [ -z "$P" ]; then echo "::error::project.godot not found"; exit 1; fi
+          echo "dir=$(dirname "$P")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Godot and the Web export templates
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/godot-bin
+            ~/.local/share/godot/export_templates
+          key: godot-${{ env.GODOT_VERSION }}-${{ env.GODOT_CHANNEL }}-web-v1
+
+      - name: Download Godot and the Web export templates (from GitHub's servers)
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          BASE="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_CHANNEL}"
+          mkdir -p "$HOME/godot-bin" /tmp/dl
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/dl/godot.zip "$BASE/Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_linux.x86_64.zip"
+          unzip -q -o /tmp/dl/godot.zip -d /tmp/dl
+          mv "/tmp/dl/Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_linux.x86_64" "$HOME/godot-bin/godot"
+          chmod +x "$HOME/godot-bin/godot"
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/dl/templates.tpz "$BASE/Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_export_templates.tpz"
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_CHANNEL}"
+          mkdir -p "$TPL"
+          unzip -j -o -q /tmp/dl/templates.tpz 'templates/web_*' 'templates/version.txt' -d "$TPL"
+          ls -la "$TPL"
+          rm -rf /tmp/dl
+
+      - name: Download the real 3D assets (characters, props, floor, weapons, textures) from GitHub
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: python3 tools/fetch_assets.py
+
+      # Put your key in: repo -> Settings -> Secrets and variables -> Actions -> ELEVENLABS_API_KEY
+      - name: Generate missing ElevenLabs sound effects + announcer (cached in the repo)
+        id: audio
+        working-directory: ${{ steps.proj.outputs.dir }}
+        env:
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+        run: python3 tools/generate_audio.py
+
+      - name: Save new audio back to the repo (so it is never generated twice)
+        if: steps.audio.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          AUDIO_DIR: ${{ steps.proj.outputs.dir }}/assets/audio
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f "$AUDIO_DIR"
+          git commit -m "chore: cache generated ElevenLabs audio [skip ci]" || exit 0
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Import the project
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          "$HOME/godot-bin/godot" --headless --import || true
+          # make the downloaded textures phone-friendly (512/1024 px, lossless WebP), then import again
+          python3 tools/prepare_textures.py
+          "$HOME/godot-bin/godot" --headless --import || true
+          "$HOME/godot-bin/godot" --headless --import || true
+
+      - name: Export the Web build (Godot generates index.html)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          mkdir -p build/web
+          "$HOME/godot-bin/godot" --headless --verbose --export-release "Web" build/web/index.html 2>&1 | tee build/export.log
+          if [ ! -s build/web/index.html ]; then
+            echo "::error::index.html was not created - see build/export.log"
+            exit 1
+          fi
+          # the peer-to-peer (Trystero) script referenced by index.html
+          cp web/strikeout_net.js build/web/strikeout_net.js
+          touch build/web/.nojekyll
+          ls -la build/web
+          echo "### STRIKEOUT 3D web build" >> "$GITHUB_STEP_SUMMARY"
+          echo "Size: $(du -sh build/web | cut -f1)  |  audio clips: $(find assets/audio -name '*.mp3' | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the web build as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: strikeout-web
+          path: ${{ steps.proj.outputs.dir }}/build/web
+
+      - name: Package for GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.proj.outputs.dir }}/build/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+        
